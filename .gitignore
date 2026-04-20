@@ -1,0 +1,23 @@
+# Environment
+.env
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Project-specific
+BUILD_GUIDE.md
+lenses/stalker-strategy.md
+
+# Case Outputs — real outputs contain PII; only sample is committed
+Case Outputs/
+!Case Outputs/sample_output.md

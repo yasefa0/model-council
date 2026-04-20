@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-council"
+version = "2026.1.1"
+description = "Model Council — Karpathy-style 3-stage multi-model council"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "httpx[http2]>=0.27.0",
+    "stamina>=24.2.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "prompt_toolkit>=3.0.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+mcp = ["fastmcp>=3.0.0"]
+
+[project.scripts]
+model-council = "council:main"
+
+[tool.setuptools]
+py-modules = ["council"]

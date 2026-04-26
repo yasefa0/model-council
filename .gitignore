@@ -19,7 +19,6 @@ venv/
 
 # Project-specific
 BUILD_GUIDE.md
-lenses/stalker-strategy.md
 
 # Case Outputs — real outputs contain PII; only sample is committed
 Case Outputs/

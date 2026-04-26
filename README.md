@@ -82,8 +82,7 @@ Lens Templates provide specialized decision frameworks for different types of qu
 
 Available templates:
 - `leap`: For evaluating high-risk, high-reward decisions or innovations
-- `career-bet`: For career path and professional development decisions 
-- `stalker-strategy`: For competitive analysis and market positioning
+- `career-bet`: For career path and professional development decisions
 
 Enable with the `--lens` flag or `:lens` in REPL mode:
 

@@ -333,6 +333,70 @@ C: [one sentence]"""
     return scores, rankings, label_to_model, labels, vs_parts
 
 
+# ── Stage 2.5: Cross-Argument Debate ──────────────────────────────────────────
+
+async def stage2b_debate(
+    or_client: AsyncOpenAI,
+    ant_client: AsyncAnthropic,
+    query: str,
+    stage1: dict[str, str],
+    lens_template: Optional[str] = None,
+) -> dict[str, dict[str, str]]:
+    """
+    Each panelist receives the OTHER panelists' Stage 1 responses (anonymized)
+    and must argue against each one. Identities hidden — no self-critique.
+    Returns: { critic_model: { target_label: critique_text } }
+    """
+    models = list(stage1.keys())
+    # Global label map so labels are consistent across all critics
+    global_labels = [chr(65 + i) for i in range(len(models))]
+    model_to_label = dict(zip(models, global_labels))
+
+    async def _debate_for_critic(critic: str) -> tuple[str, dict[str, str]]:
+        # Build prompt showing only OTHER models' responses
+        others = [(model_to_label[m], stage1[m]) for m in models if m != critic]
+        others_block = "\n\n".join(f"Response {lbl}:\n{txt}" for lbl, txt in others)
+        target_labels = [lbl for lbl, _ in others]
+        format_lines = "\n".join(f"AGAINST {lbl}: [your argument here]" for lbl, _ in others)
+
+        prompt = f"""Original question: {query}
+
+You are reviewing responses from other AI models (identities hidden).
+Your job is to argue AGAINST each response — find flaws, gaps, overconfidence,
+missing context, or factual errors. Be specific and critical. Do not be diplomatic.
+Do not defend any particular position; only attack weaknesses you see.
+
+{others_block}
+
+Reply using ONLY this format:
+{format_lines}"""
+
+        raw = await call_model(or_client, ant_client, critic, [{"role": "user", "content": prompt}], lens_template)
+
+        # Parse AGAINST X: lines from response
+        critiques: dict[str, str] = {}
+        for lbl in target_labels:
+            pattern = rf"AGAINST\s+{lbl}\s*:\s*(.*?)(?=AGAINST\s+[A-Z]\s*:|$)"
+            m = re.search(pattern, raw, re.DOTALL | re.IGNORECASE)
+            critiques[lbl] = m.group(1).strip() if m else raw.strip()
+        return critic, critiques
+
+    tasks = [_debate_for_critic(m) for m in models if not stage1[m].startswith("[ERROR")]
+    results = await asyncio.wait_for(
+        asyncio.gather(*tasks, return_exceptions=True),
+        timeout=STAGE_TIMEOUT,
+    )
+
+    debate: dict[str, dict[str, str]] = {}
+    for r in results:
+        if isinstance(r, Exception):
+            logging.warning(f"Stage 2.5: debate task failed — {r}")
+            continue
+        critic_model, critiques = r
+        debate[critic_model] = critiques
+    return debate
+
+
 # ── Stage 3: Chairman synthesis ────────────────────────────────────────────────
 
 async def stage3_synthesize(
@@ -343,6 +407,7 @@ async def stage3_synthesize(
     use_vs: bool = False,
     lens_template: Optional[str] = None,
     vs_parts: Optional[dict[str, tuple[str, str]]] = None,
+    debate: Optional[dict[str, dict[str, str]]] = None,
 ) -> tuple[str, str]:
     """Synthesize final answer from chairman model based on panel responses and scores.
     Returns (topic_title, body) tuple where topic_title is a 1-4 word summary for the filename."""
@@ -366,6 +431,19 @@ async def stage3_synthesize(
 
     topic_instruction = "Start your response with a short 1-4 word topic title on its own line prefixed with exactly TOPIC: (e.g., \"TOPIC: Rust Learning Strategy\"). Then leave a blank line before the rest of your response."
 
+    # Build debate block for chairman (model labels visible, critic identity hidden)
+    debate_block = ""
+    if debate:
+        models_list = list(stage1.keys())
+        global_labels = [chr(65 + i) for i in range(len(models_list))]
+        model_to_label = dict(zip(models_list, global_labels))
+        sections = []
+        for critic, critiques in debate.items():
+            critic_label = MODEL_LABELS.get(critic, critic)
+            lines = "\n".join(f"  Against Response {tgt}: {txt}" for tgt, txt in critiques.items())
+            sections.append(f"[{critic_label}]:\n{lines}")
+        debate_block = "\n\n".join(sections)
+
     if use_vs and vs_parts:
         # If we have verbalized sampling data, include it in the chairman's input
         vs_candidates_block = "\n\n".join(
@@ -378,6 +456,7 @@ async def stage3_synthesize(
             for m, (_, selected) in vs_parts.items()
         )
         
+        debate_section = f"\n\nCross-argument debate (each model argued against the others):\n{debate_block}" if debate_block else ""
         user_msg = f"""Original question: {query}
 
 Council answers:
@@ -390,7 +469,7 @@ Verbalized sampling candidates (probability distributions):
 {vs_candidates_block}
 
 Verbalized sampling selected responses (lowest probability):
-{vs_selected_block}
+{vs_selected_block}{debate_section}
 
 Instructions:
 1. {topic_instruction}
@@ -401,24 +480,29 @@ Instructions:
    - Note where models AGREED despite different starting distributions
    - Surface any insight that appeared only in low-probability responses
    - Flag when the tail insight changes the conclusion vs. the modal answer
-6. End with an **Agreement Map** — one line per model noting their unique contribution or blind spot.
+6. Review the cross-argument debate. Where a critique is valid, lower confidence in the target response. Where a critique is weak or wrong, note that response withstood challenge.
+7. Identify any response that survived all critiques unscathed — likely the strongest position.
+8. End with an **Agreement Map** — one line per model noting their unique contribution or blind spot.
 
 Note: weigh the *content* of answers, not just vote tallies. Verbose responses sometimes outscore concise ones due to length bias, not quality."""
     else:
+        debate_section = f"\n\nCross-argument debate (each model argued against the others):\n{debate_block}" if debate_block else ""
         user_msg = f"""Original question: {query}
 
 Council answers:
 {answers_block}
 
 Peer ranking scores (higher = rated better by peers):
-{score_summary}
+{score_summary}{debate_section}
 
 Instructions:
 1. {topic_instruction}
 2. Identify where all models agree — this is the high-confidence ground.
 3. Identify where models diverge — surface the disagreement explicitly.
 4. Write a final synthesized answer that is better than any individual response.
-5. End with an **Agreement Map** — one line per model noting their unique contribution or blind spot.
+5. Review the cross-argument debate. Where a critique is valid, lower confidence in the target response. Where a critique is weak or wrong, note that response withstood challenge.
+6. Identify any response that survived all critiques unscathed — likely the strongest position.
+7. End with an **Agreement Map** — one line per model noting their unique contribution or blind spot.
 
 Note: weigh the *content* of answers, not just vote tallies. Verbose responses sometimes outscore concise ones due to length bias, not quality."""
 
@@ -450,7 +534,7 @@ async def run_council(
     Returns the final synthesis, scores dictionary, and topic title.
     """
 
-    async def progress(msg: str, step: int, total: int = 3) -> None:
+    async def progress(msg: str, step: int, total: int = 4) -> None:
         if ctx is not None:
             await ctx.info(msg)
             await ctx.report_progress(progress=step, total=total, message=msg)
@@ -476,9 +560,12 @@ async def run_council(
             or_client, ant_client, query, stage1, use_vs, lens_template
         )
 
-        await progress("Stage 3: chairman synthesis…", 2)
+        await progress("Stage 2.5: cross-argument debate…", 2)
+        debate = await stage2b_debate(or_client, ant_client, query, stage1, lens_template)
+
+        await progress("Stage 3: chairman synthesis…", 3)
         topic_title, final = await stage3_synthesize(
-            ant_client, query, stage1, scores, use_vs, lens_template, vs_parts
+            ant_client, query, stage1, scores, use_vs, lens_template, vs_parts, debate
         )
 
         return final, scores, topic_title
@@ -527,20 +614,23 @@ async def _run_council_job(job_id: str, prompt: str, use_vs: bool, lens: Optiona
             or_client = _or_client(http_client)
             ant_client = _ant_client(http_client)
 
-            job["stage"] = "Stage 1/3: panel answering in parallel…"
+            job["stage"] = "Stage 1/4: panel answering in parallel…"
             stage1 = await stage1_collect(or_client, ant_client, prompt, use_vs, lens_template)
 
-            job["stage"] = "Stage 2/3: anonymous cross-ranking…"
+            job["stage"] = "Stage 2/4: anonymous cross-ranking…"
             scores, rankings, label_to_model, labels, vs_parts = await stage2_rank(
                 or_client, ant_client, prompt, stage1, use_vs, lens_template
             )
 
-            job["stage"] = "Stage 3/3: chairman synthesizing…"
+            job["stage"] = "Stage 2.5/4: cross-argument debate…"
+            debate = await stage2b_debate(or_client, ant_client, prompt, stage1, lens_template)
+
+            job["stage"] = "Stage 3/4: chairman synthesizing…"
             topic_title, final = await stage3_synthesize(
-                ant_client, prompt, stage1, scores, use_vs, lens_template, vs_parts
+                ant_client, prompt, stage1, scores, use_vs, lens_template, vs_parts, debate
             )
 
-        filepath = _save_output(prompt, final, scores, topic_title)
+        filepath = _save_output(prompt, final, scores, topic_title, debate)
         job.update(status="complete", result=final, scores=scores, filepath=filepath)
     except Exception as exc:
         job.update(status="error", error=str(exc))
@@ -725,7 +815,13 @@ except ImportError:
 console = Console()
 
 
-def _save_output(query: str, final: str, scores: dict[str, int], title: str = "") -> str:
+def _save_output(
+    query: str,
+    final: str,
+    scores: dict[str, int],
+    title: str = "",
+    debate: Optional[dict[str, dict[str, str]]] = None,
+) -> str:
     """Save full council synthesis to Case Outputs directory."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if title:
@@ -749,12 +845,21 @@ def _save_output(query: str, final: str, scores: dict[str, int], title: str = ""
     if "\n\n---\n**Full Council Report:**" in final:
         clean_final = final.split("\n\n---\n**Full Council Report:**")[0]
 
+    debate_md = ""
+    if debate:
+        sections = []
+        for critic, critiques in debate.items():
+            critic_label = MODEL_LABELS.get(critic, critic)
+            lines = "\n".join(f"- **Against Response {tgt}:** {txt}" for tgt, txt in critiques.items())
+            sections.append(f"### {critic_label}\n{lines}")
+        debate_md = "\n\n## Cross-Argument Debate\n" + "\n\n".join(sections)
+
     content = f"""# Model Council Synthesis
 **Date:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 **Query:** {query}
 
 ## Peer Rankings
-{score_summary}
+{score_summary}{debate_md}
 
 ## Chairman Synthesis
 {clean_final}
@@ -782,20 +887,20 @@ def _save_output(query: str, final: str, scores: dict[str, int], title: str = ""
 
 def _stage_table(stage_idx: int, start: float) -> Table:
     """Live stage-progress table shown during a council run."""
-    stage_names = ["Collecting answers", "Cross-ranking peers", "Chairman synthesis"]
-    stage_icons = ["⏳", "🔄", "⚗️"]
+    stage_names = ["Collecting answers", "Cross-ranking peers", "Cross-argument debate", "Chairman synthesis"]
+    stage_icons = ["⏳", "🔄", "⚔️", "⚗️"]
     elapsed = f"{time.time() - start:.1f}s"
     tbl = Table(box=box.ROUNDED, show_header=True, header_style="bold")
     tbl.add_column("Model", style="cyan", min_width=26)
     tbl.add_column("Current stage", min_width=36)
     tbl.add_column("Elapsed", justify="right", min_width=10)
-    icon = stage_icons[min(stage_idx, 2)]
-    name = stage_names[min(stage_idx, 2)]
+    icon = stage_icons[min(stage_idx, 3)]
+    name = stage_names[min(stage_idx, 3)]
     for m in PANEL_MODELS:
         tbl.add_row(MODEL_LABELS.get(m, m), f"{icon}  {name}", elapsed)
     tbl.add_row(
         MODEL_LABELS.get(CHAIRMAN_MODEL, CHAIRMAN_MODEL),
-        ("⚗️  Chairman synthesis" if stage_idx >= 2 else "[dim]Waiting…[/dim]"),
+        ("⚗️  Chairman synthesis" if stage_idx >= 3 else "[dim]Waiting…[/dim]"),
         elapsed,
     )
     return tbl
@@ -843,7 +948,7 @@ async def run_cli(query: str, use_vs: bool = False, lens: Optional[str] = None) 
 
             # Stage 2
             scores, rankings, label_to_model, labels, vs_parts = await stage2_rank(
-                or_client, ant_client, query, stage1, use_vs, 
+                or_client, ant_client, query, stage1, use_vs,
                 load_lens_template(lens) if lens else None
             )
             live.update(_stage_table(2, start))
@@ -855,14 +960,23 @@ async def run_cli(query: str, use_vs: bool = False, lens: Optional[str] = None) 
             )
             console.print(f"[dim]Peer scores:[/dim]  {score_str}\n")
 
+            # Stage 2.5
+            debate = await stage2b_debate(
+                or_client, ant_client, query, stage1,
+                load_lens_template(lens) if lens else None
+            )
+            live.update(_stage_table(3, start))
+            critique_count = sum(len(v) for v in debate.values())
+            console.print(f"[dim]Debate:[/dim] {critique_count} cross-critiques generated\n")
+
             # Stage 3
             topic_title, final = await stage3_synthesize(
                 ant_client, query, stage1, scores, use_vs,
-                load_lens_template(lens) if lens else None, vs_parts
+                load_lens_template(lens) if lens else None, vs_parts, debate
             )
 
     total = time.time() - start
-    filepath = _save_output(query, final, scores, topic_title)
+    filepath = _save_output(query, final, scores, topic_title, debate)
     winner_name = MODEL_LABELS.get(sorted_scores[0][0], sorted_scores[0][0])
 
     console.rule(f"[bold green]Council Complete[/bold green]  •  {total:.1f}s")

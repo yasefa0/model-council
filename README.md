@@ -1,14 +1,17 @@
 # Model Council "2026-Frontier" Build
 
-Karpathy-style three-stage multi-model council — upgraded with hybrid routing, hardened connection pooling, automatic Markdown reporting, FastMCP 3.x server mode, and a 2026-frontier panel.
+Karpathy-style multi-model council — upgraded with hybrid routing, hardened connection pooling, automatic Markdown reporting, FastMCP 3.x server mode, cross-argument debate, and a 2026-frontier panel.
 
 ## Architecture
 
 ```
-Stage 1 — Fan-out     All panel models answer in parallel
-Stage 2 — Peer jury   Each panelist ranks the others anonymously; scores tallied
-Stage 3 — Synthesis   Chairman (Claude Opus, direct Anthropic) writes final answer + agreement map
+Stage 1   — Fan-out    All panel models answer in parallel
+Stage 2   — Peer jury  Each panelist ranks the others anonymously; scores tallied
+Stage 2.5 — Debate     Each panelist argues against the other two (identities hidden)
+Stage 3   — Synthesis  Chairman (Claude Opus, direct Anthropic) writes final answer + agreement map
 ```
+
+The debate stage is the key addition: instead of only ranking, each model must find and articulate specific flaws in the other responses. The chairman then uses both the rankings and the critiques — downweighting responses that didn't survive scrutiny, flagging responses that did.
 
 ## 2026-Frontier Council
 
@@ -162,12 +165,13 @@ Any model on OpenRouter works for panel seats. Browse: https://openrouter.ai/mod
 ## Cost
 
 Each council run makes:
-- 3 parallel calls (Stage 1)
-- 3 parallel calls (Stage 2)
+- 3 parallel calls (Stage 1 — answers)
+- 3 parallel calls (Stage 2 — rankings)
+- 3 parallel calls (Stage 2.5 — debate)
 - 1 chairman call (Stage 3, Anthropic direct with caching)
-= **7 total API calls**
+= **10 total API calls**
 
-Approximate cost with default panel: **~$0.10–0.20 per query** depending on answer length.
+Approximate cost with default panel: **~$0.15–0.30 per query** depending on answer length.
 
 ## What's new in the 2026 Build
 
@@ -183,3 +187,4 @@ Approximate cost with default panel: **~$0.10–0.20 per query** depending on an
 | MCP | ✗ | ✓ FastMCP 3.x `@mcp.tool` with async start/poll pattern |
 | Uncertainty | ✗ | ✓ Verbalized Sampling (VS) with tail distribution insights |
 | Templates | ✗ | ✓ Lens Templates for specialized decision frameworks |
+| Debate | ✗ | ✓ Stage 2.5 cross-argument debate (anonymous adversarial critique) |
